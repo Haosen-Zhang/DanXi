@@ -1,0 +1,47 @@
+name: Tests
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  flutter-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: "3.47.2"
+          channel: stable
+          cache: true
+
+      - name: Install dependencies
+        run: flutter pub get
+
+      - name: Check formatting
+        run: >-
+          dart format --output=none --set-exit-if-changed
+          lib/repository/cookie/independent_cookie_jar.dart
+          test/repository/cookie/independent_cookie_jar_test.dart
+
+      - name: Analyze cookie matching
+        run: >-
+          dart analyze
+          lib/repository/cookie/independent_cookie_jar.dart
+          test/repository/cookie/independent_cookie_jar_test.dart
+
+      - name: Run cookie matching tests
+        run: >-
+          flutter test --platform chrome
+          test/repository/cookie/independent_cookie_jar_test.dart

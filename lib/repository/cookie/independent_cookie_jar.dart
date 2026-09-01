@@ -33,71 +33,85 @@ class IndependentCookieJar implements CookieJar {
   /// These cookies are private for each host name.
   ///
   final List<
-          Map<
-              String?, //domain or host
-              Map<
-                  String, //path
-                  Map<
-                      String, //cookie name
-                      SerializableCookie //cookie
-                      >>>> _cookies =
-      <Map<String?, Map<String, Map<String, SerializableCookie>>>>[
+    Map<
+      String?, //domain or host
+      Map<
+        String, //path
+        Map<
+          String, //cookie name
+          SerializableCookie //cookie
+        >
+      >
+    >
+  >
+  _cookies = <Map<String?, Map<String, Map<String, SerializableCookie>>>>[
     <String?, Map<String, Map<String, SerializableCookie>>>{},
-    <String?, Map<String, Map<String, SerializableCookie>>>{}
+    <String?, Map<String, Map<String, SerializableCookie>>>{},
   ];
 
   IndependentCookieJar({this.ignoreExpires = false});
 
   Map<String?, Map<String, Map<String, SerializableCookie>>>
-      get domainCookies => _cookies[0];
+  get domainCookies => _cookies[0];
 
   Map<String?, Map<String, Map<String, SerializableCookie>>> get hostCookies =>
       _cookies[1];
 
   @override
   Future<List<Cookie>> loadForRequest(Uri uri) async {
-    final list = <Cookie>[];
+    final matches = <(SerializableCookie, int)>[];
     final urlPath = uri.path.isEmpty ? '/' : uri.path;
     // Load cookies without "domain" attribute, include port.
     final hostname = uri.host;
     for (final domain in hostCookies.keys) {
       if (hostname == domain) {
-        final cookies =
-            hostCookies[domain]!.cast<String, Map<String, dynamic>>();
-        var keys = cookies.keys.toList()
-          ..sort((a, b) => b.length.compareTo(a.length));
-        for (final path in keys) {
-          if (urlPath.toLowerCase().contains(path)) {
-            final values = cookies[path]!;
-            for (final key in values.keys) {
-              final SerializableCookie cookie = values[key];
-              if (_check(uri.scheme, cookie)) {
-                if (list.indexWhere((e) => e.name == cookie.cookie.name) ==
-                    -1) {
-                  list.add(cookie.cookie);
-                }
-              }
+        final cookies = hostCookies[domain]!
+            .cast<String, Map<String, dynamic>>();
+        for (final path in cookies.keys) {
+          final values = cookies[path]!;
+          for (final key in values.keys) {
+            final SerializableCookie cookie = values[key];
+            final effectivePath = _storedPath(cookie.cookie, path);
+            if (_pathMatches(urlPath, effectivePath) &&
+                _check(uri.scheme, cookie)) {
+              cookie.cookie.path = effectivePath;
+              matches.add((cookie, matches.length));
             }
           }
         }
       }
     }
     // Load cookies with "domain" attribute, Ignore port.
-    domainCookies.forEach(
-        (String? domain, Map<String, Map<String, SerializableCookie>> cookies) {
-      if (uri.host.contains(domain!)) {
+    domainCookies.forEach((
+      String? domain,
+      Map<String, Map<String, SerializableCookie>> cookies,
+    ) {
+      if (_domainMatches(uri.host, domain!)) {
         cookies.forEach((String path, Map<String, SerializableCookie> values) {
-          if (urlPath.toLowerCase().contains(path)) {
-            values.forEach((String key, SerializableCookie v) {
-              if (_check(uri.scheme, v)) {
-                list.add(v.cookie);
-              }
-            });
-          }
+          values.forEach((String key, SerializableCookie cookie) {
+            final effectivePath = _storedPath(cookie.cookie, path);
+            if (_pathMatches(urlPath, effectivePath) &&
+                _check(uri.scheme, cookie)) {
+              cookie.cookie.path = effectivePath;
+              matches.add((cookie, matches.length));
+            }
+          });
         });
       }
     });
-    return list;
+    matches.sort((a, b) {
+      final pathComparison = (b.$1.cookie.path?.length ?? 0).compareTo(
+        a.$1.cookie.path?.length ?? 0,
+      );
+      if (pathComparison != 0) return pathComparison;
+      final creationComparison = a.$1.createTimeStamp.compareTo(
+        b.$1.createTimeStamp,
+      );
+      return creationComparison != 0
+          ? creationComparison
+          : a.$2.compareTo(b.$2);
+    });
+    return matches.map((match) => match.$1.cookie).toList(growable: false);
   }
 
   @override
@@ -111,13 +125,16 @@ class IndependentCookieJar implements CookieJar {
         if (domain.startsWith('.')) {
           domain = domain.substring(1);
         }
-        path = cookie.path ?? '/';
+        domain = domain.toLowerCase();
+        if (!_domainMatches(uri.host, domain)) continue;
+        path = _effectivePath(cookie.path, uri.path);
       } else {
         index = 1;
         // Save cookies without "domain" attribute
-        path = cookie.path ?? (uri.path.isEmpty ? '/' : uri.path);
+        path = _effectivePath(cookie.path, uri.path);
         domain = uri.host;
       }
+      cookie.path = path;
       var mapDomain =
           _cookies[index][domain] ?? <String, Map<String, dynamic>>{};
       mapDomain = mapDomain.cast<String, Map<String, dynamic>>();
@@ -128,8 +145,8 @@ class IndependentCookieJar implements CookieJar {
         map.remove(cookie.name);
       }
       mapDomain[path] = map.cast<String, SerializableCookie>();
-      _cookies[index][domain] =
-          mapDomain.cast<String, Map<String, SerializableCookie>>();
+      _cookies[index][domain] = mapDomain
+          .cast<String, Map<String, SerializableCookie>>();
     }
   }
 
@@ -143,8 +160,9 @@ class IndependentCookieJar implements CookieJar {
     hostCookies.remove(host);
     if (withDomainSharedCookie) {
       domainCookies.removeWhere(
-          (String? domain, Map<String, Map<String, SerializableCookie>> v) =>
-              uri.host.contains(domain!));
+        (String? domain, Map<String, Map<String, SerializableCookie>> v) =>
+            _domainMatches(uri.host, domain!),
+      );
     }
   }
 
@@ -159,8 +177,57 @@ class IndependentCookieJar implements CookieJar {
     return ignoreExpires ? false : cookie!.isExpired();
   }
 
+  static bool _domainMatches(String host, String domain) {
+    final normalizedHost = host.toLowerCase();
+    final normalizedDomain = domain.toLowerCase();
+    if (normalizedHost == normalizedDomain) return true;
+    if (_isIpAddress(normalizedHost)) return false;
+    if (!normalizedDomain.contains('.')) return false;
+    return normalizedHost.endsWith('.$normalizedDomain');
+  }
+
+  static bool _isIpAddress(String host) {
+    if (host.contains(':')) return true;
+    final parts = host.split('.');
+    if (parts.length != 4) return false;
+    for (final part in parts) {
+      final value = int.tryParse(part);
+      if (value == null || value < 0 || value > 255) return false;
+    }
+    return true;
+  }
+
+  static bool _pathMatches(String requestPath, String cookiePath) {
+    if (requestPath == cookiePath) return true;
+    if (!requestPath.startsWith(cookiePath)) return false;
+    return cookiePath.endsWith('/') || requestPath[cookiePath.length] == '/';
+  }
+
+  static String _defaultPath(String requestPath) {
+    if (!requestPath.startsWith('/')) return '/';
+    final lastSlash = requestPath.lastIndexOf('/');
+    return lastSlash <= 0 ? '/' : requestPath.substring(0, lastSlash);
+  }
+
+  static String _effectivePath(String? cookiePath, String requestPath) {
+    if (cookiePath == null ||
+        cookiePath.isEmpty ||
+        !cookiePath.startsWith('/')) {
+      return _defaultPath(requestPath);
+    }
+    return cookiePath;
+  }
+
+  static String _storedPath(Cookie cookie, String storedPath) {
+    final path = cookie.path;
+    return path == null || path.isEmpty || !path.startsWith('/')
+        ? _defaultPath(storedPath)
+        : path;
+  }
+
   bool _check(String scheme, SerializableCookie cookie) {
-    return cookie.cookie.secure && scheme == 'https' || !_isExpired(cookie);
+    if (_isExpired(cookie)) return false;
+    return !cookie.cookie.secure || scheme == 'https';
   }
 
   factory IndependentCookieJar.createFrom(IndependentCookieJar otherJar) =>
@@ -175,16 +242,18 @@ class IndependentCookieJar implements CookieJar {
   }
 
   static void _deepClone(
-      Map<String?, Map<String, Map<String, SerializableCookie>>> from,
-      Map<String?, Map<String, Map<String, SerializableCookie>>> to) {
+    Map<String?, Map<String, Map<String, SerializableCookie>>> from,
+    Map<String?, Map<String, Map<String, SerializableCookie>>> to,
+  ) {
     to.clear();
     from.forEach((host, value) {
       to[host] = {};
       value.forEach((path, value) {
         to[host]![path] = {};
         value.forEach((cookieName, value) {
-          to[host]![path]![cookieName] =
-              SerializableCookie.fromJson(value.toJson());
+          to[host]![path]![cookieName] = SerializableCookie.fromJson(
+            value.toJson(),
+          );
         });
       });
     });
